@@ -1,0 +1,34 @@
+MATCHER V2 — обновление существующей установки
+==============================================
+
+Если у тебя уже настроены config.yaml, data/sync.db и токены, НЕ удаляй их.
+Достаточно заменить файл:
+
+    sync_music/matcher.py
+
+на версию из этого архива.
+
+Затем в существующем config.yaml желательно поменять блок matching на:
+
+matching:
+  min_score: 86
+  candidate_limit: 30
+  high_confidence_score: 94
+  duration_tolerance_ms: 8000
+  debug_unmatched: true
+
+Важно:
+- Уже успешно matched треки остаются в SQLite и повторно не ищутся.
+- Старые unmatched НЕ зафиксированы навсегда: при следующем sync они автоматически
+  будут искаться заново новым matcher v2.
+- Удалять data/sync.db не нужно.
+
+Запуск:
+
+    python run.py sync liked
+
+Для отклонённого кандидата matcher теперь печатает его score, например:
+
+    [matcher] best rejected 81.4 (title=100, artist=72, duration=45): ...
+
+Это помогает понять, почему конкретный трек не был принят автоматически.
