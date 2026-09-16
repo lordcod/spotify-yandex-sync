@@ -2,33 +2,25 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 
 from rapidfuzz import fuzz
 
 from .db import Database
-from .models import SourceTrack, YandexTrackRef
+from .models import SpotifyTrack, YandexTrack
 
 
-# Things that often differ between Spotify/Yandex metadata but do not necessarily
-# mean it is a different recording. We strip them for the main title comparison;
-# duration still protects us from matching a random live/cover version.
 BRACKET_NOISE = re.compile(
-    r"\s*[\(\[](?:"
-    r"remaster(?:ed)?(?:\s*\d{2,4})?|"
-    r"radio\s+edit|edit|version|deluxe|bonus|explicit|clean|mono|stereo|"
-    r"original\s+mix|single\s+version"
-    r")[^\)\]]*[\)\]]",
+    r"\s*[\(\[](?:remaster(?:ed)?(?:\s*\d{2,4})?|radio\s+edit|edit|version|"
+    r"deluxe|bonus|explicit|clean|mono|stereo|original\s+mix|single\s+version)"
+    r"[^\)\]]*[\)\]]",
     re.IGNORECASE,
 )
 FEAT = re.compile(r"\s+(?:feat\.?|ft\.?)\s+.*$", re.IGNORECASE)
 NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
 SPACES = re.compile(r"\s+")
 
-# A Spotify catalogue quite often romanizes Russian artist names while Yandex
-# stores them in Cyrillic. This transliteration intentionally follows the common
-# English-style forms (Моя -> Moya, Сергей -> Sergey, Юлия -> Yuliya) rather than
-# a strict scientific standard.
 RU_TO_LAT = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
     "ё": "yo", "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k",
@@ -48,264 +40,306 @@ class CandidateScore:
     album: float
 
 
+class TextMatcher:
+    """Text cleanup and fuzzy comparison for Spotify/Yandex metadata."""
+
+    @staticmethod
+    def normalize(text: str) -> str:
+        text = unicodedata.normalize("NFKC", text or "").casefold().replace("ё", "е")
+        text = BRACKET_NOISE.sub("", text)
+        text = FEAT.sub("", text)
+        text = NON_WORD.sub(" ", text)
+        return SPACES.sub(" ", text).strip()
+
+    @staticmethod
+    def transliterate(text: str) -> str:
+        text = unicodedata.normalize("NFKC", text or "").casefold()
+        return "".join(RU_TO_LAT.get(char, char) for char in text)
+
+    @classmethod
+    def latinize(cls, text: str) -> str:
+        return cls.normalize(cls.transliterate(text))
+
+    @classmethod
+    def similarity(cls, left: str, right: str) -> float:
+        left_variants = {cls.normalize(left), cls.latinize(left)} - {""}
+        right_variants = {cls.normalize(right), cls.latinize(right)} - {""}
+        return max(
+            (
+                max(float(fuzz.ratio(a, b)), float(fuzz.token_set_ratio(a, b)))
+                for a in left_variants
+                for b in right_variants
+            ),
+            default=0.0,
+        )
+
+    @classmethod
+    def artists_similarity(cls, source: list[str], target: list[str]) -> float:
+        if not source:
+            return 70.0
+        if not target:
+            return 0.0
+
+        source_coverage = sum(max(cls.similarity(a, b) for b in target) for a in source) / len(source)
+        target_coverage = sum(max(cls.similarity(b, a) for a in source) for b in target) / len(target)
+        return source_coverage * 0.88 + target_coverage * 0.12
+
+
+class CandidateScorer:
+    """Scores a search result without knowing where it came from."""
+
+    def __init__(self, duration_tolerance_ms: int):
+        self.duration_tolerance_ms = duration_tolerance_ms
+
+    def score(self, source: SpotifyTrack | YandexTrack, candidate) -> CandidateScore:
+        title = TextMatcher.similarity(source.title, getattr(candidate, "title", "") or "")
+        artist = TextMatcher.artists_similarity(source.artists, _artists(candidate))
+        duration = self._duration(source.duration_ms, getattr(candidate, "duration_ms", None))
+        album = self._album(source, candidate)
+
+        total = title * 0.45 + artist * 0.32 + duration * 0.20 + album * 0.03
+        if title < 70:
+            total -= (70 - title) * 0.35
+        if artist < 70:
+            total -= (55 - artist) * 0.35
+
+        return CandidateScore(max(0.0, total), title, artist, duration, album)
+
+    def _duration(self, source_ms: int | None, target_ms: int | None) -> float:
+        if not source_ms or not target_ms:
+            return 70.0
+
+        delta = abs(int(source_ms) - int(target_ms))
+        if delta <= 1500:
+            return 100.0
+        if delta <= 3000:
+            return 97.0
+        if delta <= self.duration_tolerance_ms:
+            span = max(1, self.duration_tolerance_ms - 3000)
+            return 97.0 - ((delta - 3000) / span) * 27.0
+        if delta <= 15000:
+            return 45.0
+        if delta <= 30000:
+            return 20.0
+        return 5.0
+
+    @staticmethod
+    def _album(source: SpotifyTrack | YandexTrack, candidate) -> float:
+        if not isinstance(source, SpotifyTrack) or not source.album:
+            return 70.0
+
+        albums = [a.title for a in (getattr(candidate, "albums", None) or []) if getattr(a, "title", None)]
+        return max((TextMatcher.similarity(source.album, title) for title in albums), default=70.0)
+
+
+# Compatibility with existing imports from this module.
 def normalize(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text or "").casefold().replace("ё", "е")
-    text = BRACKET_NOISE.sub("", text)
-    text = FEAT.sub("", text)
-    text = NON_WORD.sub(" ", text)
-    return SPACES.sub(" ", text).strip()
+    return TextMatcher.normalize(text)
 
 
 def transliterate_ru(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text or "").casefold()
-    return "".join(RU_TO_LAT.get(ch, ch) for ch in text)
+    return TextMatcher.transliterate(text)
 
 
 def latinize(text: str) -> str:
-    """Normalize and transliterate Cyrillic so Latin/Cyrillic names can match."""
-    return normalize(transliterate_ru(text))
+    return TextMatcher.latinize(text)
 
 
-def _variants(text: str) -> tuple[str, ...]:
-    normal = normalize(text)
-    latin = latinize(text)
-    values: list[str] = []
-    for value in (normal, latin):
-        if value and value not in values:
-            values.append(value)
-    return tuple(values)
-
-
-def _text_similarity(left: str, right: str) -> float:
-    best = 0.0
-    for a in _variants(left):
-        for b in _variants(right):
-            # ratio is important for titles; token_set handles punctuation/order
-            # differences in artist credits and multi-word names.
-            best = max(best, float(fuzz.ratio(a, b)), float(fuzz.token_set_ratio(a, b)))
-    return best
+def score_candidate(source, candidate, duration_tolerance_ms: int) -> CandidateScore:
+    return CandidateScorer(duration_tolerance_ms).score(source, candidate)
 
 
 def _artists(track) -> list[str]:
     try:
-        return [x for x in track.artists_name() if x]
+        return [name for name in track.artists_name() if name]
     except Exception:
-        return [a.name for a in (getattr(track, "artists", None) or []) if getattr(a, "name", None)]
-
-
-def _album_titles(track) -> list[str]:
-    result: list[str] = []
-    for album in getattr(track, "albums", None) or []:
-        title = getattr(album, "title", None)
-        if title:
-            result.append(str(title))
-    return result
-
-
-def _artist_similarity(source_artists: list[str], target_artists: list[str]) -> float:
-    if not source_artists:
-        return 70.0
-    if not target_artists:
-        return 0.0
-
-    # Each Spotify artist should have a good counterpart on Yandex. Extra Yandex
-    # credits are only a small penalty because catalogues often credit features
-    # differently.
-    source_coverage = sum(
-        max(_text_similarity(src, dst) for dst in target_artists)
-        for src in source_artists
-    ) / len(source_artists)
-    target_coverage = sum(
-        max(_text_similarity(dst, src) for src in source_artists)
-        for dst in target_artists
-    ) / len(target_artists)
-    return source_coverage * 0.88 + target_coverage * 0.12
-
-
-def _duration_similarity(source_ms: int | None, target_ms: int | None, tolerance_ms: int) -> float:
-    if not source_ms or not target_ms:
-        return 70.0
-    delta = abs(int(source_ms) - int(target_ms))
-    if delta <= 1500:
-        return 100.0
-    if delta <= 3000:
-        return 97.0
-    if delta <= tolerance_ms:
-        # Smoothly decrease from ~97 to 70 inside the configured tolerance.
-        span = max(1, tolerance_ms - 3000)
-        return 97.0 - ((delta - 3000) / span) * 27.0
-    if delta <= 15000:
-        return 45.0
-    if delta <= 30000:
-        return 20.0
-    return 5.0
-
-
-def score_candidate(source: SourceTrack, candidate, duration_tolerance_ms: int) -> CandidateScore:
-    title_score = _text_similarity(source.title, str(getattr(candidate, "title", "") or ""))
-    artist_score = _artist_similarity(source.artists, _artists(candidate))
-    duration_score = _duration_similarity(
-        source.duration_ms,
-        getattr(candidate, "duration_ms", None),
-        duration_tolerance_ms,
-    )
-
-    album_score = 70.0
-    if source.album:
-        albums = _album_titles(candidate)
-        if albums:
-            album_score = max(_text_similarity(source.album, album) for album in albums)
-
-    # Title/artist decide identity; duration is a strong guard against covers,
-    # live takes and wrong recordings. Album is intentionally weak because
-    # compilations/reissues differ between services.
-    total = (
-        title_score * 0.45
-        + artist_score * 0.32
-        + duration_score * 0.20
-        + album_score * 0.03
-    )
-
-    # A candidate with a substantially different title or no artist agreement
-    # should never pass merely because duration happens to be close.
-    if title_score < 70:
-        total -= (70 - title_score) * 0.35
-    if artist_score < 70:
-        total -= (55 - artist_score) * 0.35
-
-    return CandidateScore(
-        total=max(0.0, total),
-        title=title_score,
-        artist=artist_score,
-        duration=duration_score,
-        album=album_score,
-    )
+        return [a for a in (getattr(track, "artists", None) or [])]
 
 
 class Matcher:
-    def __init__(self, yandex_client, db: Database, cfg: dict):
+    def __init__(self, yandex_client, spotify_client, db: Database, cfg: dict):
         self.client = yandex_client
+        self.spotify_client = spotify_client
         self.db = db
         self.min_score = float(cfg.get("min_score", 86))
         self.high_confidence_score = float(cfg.get("high_confidence_score", 94))
         self.candidate_limit = int(cfg.get("candidate_limit", 30))
-        self.duration_tolerance_ms = int(cfg.get("duration_tolerance_ms", 8000))
         self.debug_unmatched = bool(cfg.get("debug_unmatched", True))
+        self.scorer = CandidateScorer(int(cfg.get("duration_tolerance_ms", 8000)))
+
+    # Search -----------------------------------------------------------------
+
+    def _search_queries(self, source: SpotifyTrack | YandexTrack) -> list[str]:
+        artists = [a.strip() for a in source.artists[:2] if a and a.strip()]
+        main_artist = artists[0] if artists else ""
+        combined = " ".join([*artists, source.title])
+
+        queries = [combined, f"{source.title} {main_artist}", source.title]
+        latin = latinize(combined)
+        if latin and latin != normalize(combined):
+            queries.append(latin)
+
+        result, seen = [], set()
+        for query in queries:
+            query = query.strip()
+            key = normalize(query)
+            if query and key and key not in seen:
+                result.append(query)
+                seen.add(key)
+        return result
+
+    def _search_yandex(self, query: str) -> list:
+        try:
+            page = self.client.search(query, type_="track")
+            return list(getattr(getattr(page, "tracks", None), "results", None) or [])[: self.candidate_limit]
+        except Exception:
+            return []
+
+    def _search_spotify(self, query: str) -> list:
+        try:
+            return list(self.spotify_client.search(query) or [])[: self.candidate_limit]
+        except Exception:
+            return []
+
+    def _find_best_candidate(
+        self,
+        source: SpotifyTrack | YandexTrack,
+        search: Callable[[str], list],
+        key: Callable[[object], Hashable | None],
+    ) -> tuple[object | None, CandidateScore | None]:
+        candidates: dict[Hashable, object] = {}
+        best = score = None
+
+        for query in self._search_queries(source):
+            for candidate in search(query):
+                if (candidate_key := key(candidate)) is not None:
+                    candidates.setdefault(candidate_key, candidate)
+
+            best, score = self._best(source, candidates.values())
+            if score and score.total >= self.high_confidence_score:
+                break
+
+        return best, score
+
+    def _best(self, source, candidates: Iterable) -> tuple[object | None, CandidateScore | None]:
+        best = best_score = None
+        for candidate in candidates:
+            score = self.scorer.score(source, candidate)
+            if best_score is None or score.total > best_score.total:
+                best, best_score = candidate, score
+        return best, best_score
 
     @staticmethod
-    def _candidate_key(candidate) -> tuple[str, str]:
-        track_id = str(getattr(candidate, "id", "") or "")
-        albums = getattr(candidate, "albums", None) or []
+    def _yandex_key(track) -> tuple[str, str] | None:
+        track_id = str(getattr(track, "id", "") or "")
+        if not track_id:
+            return None
+        albums = getattr(track, "albums", None) or []
         album_id = str(getattr(albums[0], "id", "") or "") if albums else ""
         return track_id, album_id
 
-    def _search_queries(self, source: SourceTrack) -> list[str]:
-        artists = [a.strip() for a in source.artists[:2] if a and a.strip()]
-        main_artist = artists[0] if artists else ""
-        queries = [
-            " ".join([*artists, source.title]).strip(),
-            " ".join([source.title, main_artist]).strip(),
-            source.title.strip(),
-        ]
+    @staticmethod
+    def _spotify_key(track) -> str | None:
+        return getattr(track, "source_id", None) or None
 
-        # If the source itself contains Cyrillic, also try a Latin query because
-        # some catalogue entries are stored under a romanized artist/title.
-        latin_query = latinize(" ".join([*artists, source.title]))
-        original_norm = normalize(" ".join([*artists, source.title]))
-        if latin_query and latin_query != original_norm:
-            queries.append(latin_query)
+    # Cache / DB --------------------------------------------------------------
 
-        unique: list[str] = []
-        seen: set[str] = set()
-        for query in queries:
-            key = normalize(query)
-            if query and key and key not in seen:
-                unique.append(query)
-                seen.add(key)
-        return unique
+    def _cached_yandex(self, source: SpotifyTrack) -> YandexTrack | None:
+        row = self.db.get_mapping(source.source_id)
+        if not row or row["status"] != "matched" or not row["yandex_track_id"]:
+            return None
+        return YandexTrack(
+            row["yandex_track_id"], row["yandex_album_id"], row["yandex_title"] or source.title,
+            (row["yandex_artists"] or "").split(" | ") if row["yandex_artists"] else [],
+            None, float(row["match_score"] or 100),
+        )
 
-    def _search(self, query: str) -> list:
-        try:
-            search = self.client.search(query, type_="track")
-        except Exception:
-            return []
-        tracks_page = getattr(search, "tracks", None)
-        results = getattr(tracks_page, "results", None) if tracks_page else None
-        return list(results or [])[: self.candidate_limit]
+    def _cached_spotify(self, track: YandexTrack) -> SpotifyTrack | None:
+        row = self.db.get_mapping_from_yandex(track.track_id, track.album_id)
+        if not row or row["status"] != "matched" or not row["source_track_id"]:
+            return None
+        return SpotifyTrack(
+            row["source_track_id"], row["source_title"], row["source_artists"],
+            row["source_duration_ms"], "", "", row["match_score"],
+        )
 
-    def _best(self, source: SourceTrack, candidates: list) -> tuple[object | None, CandidateScore | None]:
-        best_obj = None
-        best_score: CandidateScore | None = None
-        for candidate in candidates:
-            value = score_candidate(source, candidate, self.duration_tolerance_ms)
-            if best_score is None or value.total > best_score.total:
-                best_obj, best_score = candidate, value
-        return best_obj, best_score
-
-    def match(self, source_kind: str, source: SourceTrack) -> YandexTrackRef | None:
-        cached = self.db.get_mapping(source_kind, source.source_id)
-        if cached and cached["status"] == "matched" and cached["yandex_track_id"]:
-            return YandexTrackRef(
-                track_id=cached["yandex_track_id"],
-                album_id=cached["yandex_album_id"],
-                title=cached["yandex_title"] or source.title,
-                artists=(cached["yandex_artists"] or "").split(" | ") if cached["yandex_artists"] else [],
-                duration_ms=None,
-                score=float(cached["match_score"] or 100),
-            )
-
-        candidates_by_key: dict[tuple[str, str], object] = {}
-        best_obj = None
-        best_score: CandidateScore | None = None
-
-        # Progressive fallback: common tracks normally succeed on the first query,
-        # while troublesome transliterated names fall back to title-only search.
-        for query in self._search_queries(source):
-            for candidate in self._search(query):
-                key = self._candidate_key(candidate)
-                if key[0]:
-                    candidates_by_key.setdefault(key, candidate)
-
-            best_obj, best_score = self._best(source, list(candidates_by_key.values()))
-            if best_score and best_score.total >= self.high_confidence_score:
-                break
-
-        if best_obj is None or best_score is None or best_score.total < self.min_score:
+    def _save_unmatched(self, source_kind: str, source, score: CandidateScore | None) -> None:
+        value = score.total if score else None
+        if isinstance(source, SpotifyTrack):
             self.db.save_mapping(
-                source_kind, source.source_id, source.title, source.artist_text,
-                source.duration_ms, None, None, None, None,
-                None if best_score is None else best_score.total, "unmatched"
+                source_kind, source.source_id, source.title, source.artist_text, source.duration_ms,
+                None, None, None, None, value, "unmatched",
             )
-            if self.debug_unmatched and best_obj is not None and best_score is not None:
-                print(
-                    "[matcher] best rejected "
-                    f"{best_score.total:.1f} "
-                    f"(title={best_score.title:.0f}, artist={best_score.artist:.0f}, "
-                    f"duration={best_score.duration:.0f}): "
-                    f"{', '.join(_artists(best_obj))} — {getattr(best_obj, 'title', '?')}"
-                )
+        else:
+            self.db.save_mapping(
+                source_kind, None, None, None, None,
+                source.track_id, source.album_id, source.title, "".join(source.artists), value, "unmatched",
+            )
+
+    def _save_match(self, source_kind: str, source, target, score: CandidateScore) -> None:
+        if isinstance(source, SpotifyTrack):
+            self.db.save_mapping(
+                source_kind, source.source_id, source.title, source.artist_text, source.duration_ms,
+                target.track_id, target.album_id, target.title, " | ".join(target.artists),
+                score.total, "matched",
+            )
+        else:
+            self.db.save_mapping(
+                source_kind, target.source_id, target.title, target.artist_text, target.duration_ms,
+                source.track_id, source.album_id, source.title, ", ".join(source.artists),
+                score.total, "matched",
+            )
+
+    def _debug_rejected(self, candidate, score: CandidateScore | None) -> None:
+        if not self.debug_unmatched or candidate is None or score is None:
+            return
+        print(
+            f"[matcher] best rejected {score.total:.1f} "
+            f"(title={score.title:.0f}, artist={score.artist:.0f}, duration={score.duration:.0f}): "
+            f"{', '.join(_artists(candidate))} — {getattr(candidate, 'title', '?')}"
+        )
+
+    def _accepted(self, candidate, score: CandidateScore | None) -> bool:
+        return candidate is not None and score is not None and score.total >= self.min_score
+
+    # Public API --------------------------------------------------------------
+
+    def match(self, source_kind: str, source: SpotifyTrack) -> YandexTrack | None:
+        if cached := self._cached_yandex(source):
+            return cached
+
+        candidate, score = self._find_best_candidate(source, self._search_yandex, self._yandex_key)
+        if not self._accepted(candidate, score):
+            self._save_unmatched(source_kind, source, score)
+            self._debug_rejected(candidate, score)
             return None
 
-        albums = getattr(best_obj, "albums", None) or []
+        albums = getattr(candidate, "albums", None) or []
         album_id = str(albums[0].id) if albums else ""
         if not album_id:
-            self.db.save_mapping(
-                source_kind, source.source_id, source.title, source.artist_text,
-                source.duration_ms, None, None, None, None, best_score.total, "unmatched"
-            )
+            self._save_unmatched(source_kind, source, score)
             return None
 
-        ref = YandexTrackRef(
-            track_id=str(best_obj.id),
-            album_id=album_id,
-            title=best_obj.title,
-            artists=_artists(best_obj),
-            duration_ms=getattr(best_obj, "duration_ms", None),
-            score=best_score.total,
+        result = YandexTrack(
+            str(candidate.id), album_id, candidate.title, _artists(candidate),
+            getattr(candidate, "duration_ms", None), score.total,
         )
-        self.db.save_mapping(
-            source_kind, source.source_id, source.title, source.artist_text,
-            source.duration_ms, ref.track_id, ref.album_id, ref.title,
-            " | ".join(ref.artists), ref.score, "matched"
-        )
-        return ref
+        self._save_match(source_kind, source, result, score)
+        return result
+
+    def yandex_match(self, source_kind: str, track: YandexTrack) -> SpotifyTrack | None:
+        if cached := self._cached_spotify(track):
+            return cached
+
+        candidate, score = self._find_best_candidate(track, self._search_spotify, self._spotify_key)
+        if not self._accepted(candidate, score):
+            self._save_unmatched(source_kind, track, score)
+            self._debug_rejected(candidate, score)
+            return None
+
+        if not candidate.source_id:
+            self._save_unmatched(source_kind, track, score)
+            return None
+
+        self._save_match(source_kind, track, candidate, score)
+        return candidate

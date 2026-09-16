@@ -5,10 +5,10 @@ import time
 from pathlib import Path
 from typing import Iterable
 
-from yandex_music import Client
+from yandex_music import Client, Track
 from yandex_music.utils.difference import Difference
 
-from .models import YandexTrackRef
+from .models import YandexTrack
 
 
 class YandexAuthError(RuntimeError):
@@ -83,7 +83,7 @@ class YandexTarget:
                 ids.append(f"{track_id}:{album_id}")
         return ids
 
-    def replace_if_changed(self, playlist, desired: list[YandexTrackRef]) -> bool:
+    def replace_if_changed(self, playlist, desired: list[YandexTrack]) -> bool:
         current_ids = self.playlist_ids(playlist)
         desired_ids = [x.full_id for x in desired]
         if current_ids == desired_ids:
@@ -168,3 +168,14 @@ class YandexTarget:
             "removed": len(to_remove),
             "current_before": len(current),
         }
+    
+    def get_likes(self) -> list[YandexTrack]:
+        return [
+            YandexTrack(track.id,
+                        track.albums[0].id, 
+                        track.title, 
+                        [art.name for art in track.artists],
+                        track.duration_ms)
+            for track in self.client.tracks(list(self.liked_track_ids()))
+            if track.albums
+        ]

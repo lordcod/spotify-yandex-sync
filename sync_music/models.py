@@ -2,13 +2,14 @@ from dataclasses import dataclass
 
 
 @dataclass(slots=True)
-class SourceTrack:
+class SpotifyTrack:
     source_id: str
     title: str
     artists: list[str]
     duration_ms: int | None = None
     album: str | None = None
     source_url: str | None = None
+    score: float | None = None
 
     @property
     def artist_text(self) -> str:
@@ -16,13 +17,13 @@ class SourceTrack:
 
 
 @dataclass(slots=True)
-class YandexTrackRef:
+class YandexTrack:
     track_id: str
     album_id: str
     title: str
     artists: list[str]
     duration_ms: int | None
-    score: float
+    score: float | None = None
 
     @property
     def full_id(self) -> str:

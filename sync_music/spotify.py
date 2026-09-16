@@ -13,14 +13,13 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
-from .models import SourceTrack
+from .models import SpotifyTrack
 
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_URL = "https://api.spotify.com/v1"
-SCOPES = "user-library-read playlist-read-private"
-
+SCOPES = "user-library-read user-library-modify playlist-read-private"
 
 class SpotifyAuthError(RuntimeError):
     pass
@@ -170,22 +169,51 @@ class SpotifyClient:
                 timeout=self.timeout,
             )
             if resp.status_code == 429 and attempt < 3:
+                print('Spotify rate limit hit. Retrying in %s seconds...' % resp.headers.get("Retry-After", "2"))
                 time.sleep(int(resp.headers.get("Retry-After", "2")))
                 continue
             self._raise(resp)
             return resp.json()
         raise SpotifyAuthError("Spotify rate limit")
 
+    def search(self, query: str) -> list[SpotifyTrack]:
+        results = self.get(
+            "/search",
+            {
+                "q": query,
+                "type": "track",
+                "include_external": "audio",
+                "locale": "ru",
+            },
+        )
+
+        tracks = results.get("tracks", {}).get("items", [])
+
+        return [
+            parsed
+            for track in tracks
+            if (parsed := self._to_track(track)) is not None
+        ]
+
     @staticmethod
-    def _to_track(obj: dict) -> SourceTrack | None:
+    def _to_track(obj: dict) -> SpotifyTrack | None:
         if not obj or obj.get("type") not in {None, "track"}:
             return None
+
         track_id = obj.get("id")
         title = obj.get("name")
+
         if not track_id or not title:
             return None
-        artists = [a.get("name", "") for a in obj.get("artists", []) if a.get("name")]
-        return SourceTrack(
+
+        artists = [
+            a["name"]
+            for a in obj.get("artists", [])
+            if a.get("name")
+        ]
+
+
+        track = SpotifyTrack(
             source_id=str(track_id),
             title=title,
             artists=artists,
@@ -194,8 +222,10 @@ class SpotifyClient:
             source_url=(obj.get("external_urls") or {}).get("spotify"),
         )
 
-    def liked_tracks(self) -> list[SourceTrack]:
-        items: list[SourceTrack] = []
+        return track
+
+    def liked_tracks(self) -> list[SpotifyTrack]:
+        items: list[SpotifyTrack] = []
         offset = 0
         while True:
             data = self.get("/me/tracks", {"limit": 50, "offset": offset})
@@ -221,8 +251,8 @@ class SpotifyClient:
             offset += len(batch)
         return playlists
 
-    def playlist_tracks(self, playlist_id: str) -> list[SourceTrack]:
-        items: list[SourceTrack] = []
+    def playlist_tracks(self, playlist_id: str) -> list[SpotifyTrack]:
+        items: list[SpotifyTrack] = []
         offset = 0
         while True:
             data = self.get(
@@ -238,3 +268,66 @@ class SpotifyClient:
                 break
             offset += len(batch)
         return items
+
+    def _library_request(self, method: str, track_ids: set[str]) -> None:
+        ids = list(track_ids)
+
+        for start in range(0, len(ids), 40):
+            batch = ids[start:start + 40]
+
+            uris = ",".join(
+                f"spotify:track:{track_id}"
+                for track_id in batch
+            )
+
+            for attempt in range(4):
+                resp = self.session.request(
+                    method,
+                    f"{API_URL}/me/library",
+                    params={"uris": uris},
+                    headers={
+                        "Authorization": f"Bearer {self._access_token()}"
+                    },
+                    timeout=self.timeout,
+                )
+
+                if resp.status_code == 429 and attempt < 3:
+                    time.sleep(int(resp.headers.get("Retry-After", "2")))
+                    continue
+
+                self._raise(resp)
+                break
+    
+    def sync_likes(
+        self,
+        desired_track_ids: set[str],
+        managed_remove_ids: set[str] | None = None,
+    ) -> dict[str, int | bool]:
+        current = {
+            track.source_id
+            for track in self.liked_tracks()
+        }
+
+        to_add = desired_track_ids - current
+
+        to_remove = (
+            set()
+            if managed_remove_ids is None
+            else (current & managed_remove_ids) - desired_track_ids
+        )
+
+        if to_add:
+            print('Add', to_add)
+            # self._library_request("PUT", to_add)
+
+        if to_remove:
+            print('Remove', to_remove)
+            # self._library_request("DELETE", to_remove)
+
+        return {
+            "changed": bool(to_add or to_remove),
+            "added": len(to_add),
+            "removed": len(to_remove),
+            "current_before": len(current),
+            "current_after": len(current) + len(to_add) - len(to_remove),
+        }

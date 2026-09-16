@@ -8,9 +8,9 @@ from typing import Any, Iterable
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS track_map (
     source_kind TEXT NOT NULL,
-    source_track_id TEXT NOT NULL,
-    source_title TEXT NOT NULL,
-    source_artists TEXT NOT NULL,
+    source_track_id TEXT,
+    source_title TEXT,
+    source_artists TEXT,
     source_duration_ms INTEGER,
     yandex_track_id TEXT,
     yandex_album_id TEXT,
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS track_map (
     match_score REAL,
     status TEXT NOT NULL DEFAULT 'matched',
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (source_kind, source_track_id)
+    PRIMARY KEY (source_kind, source_track_id, yandex_track_id)
 );
 
 CREATE TABLE IF NOT EXISTS playlist_state (
@@ -72,18 +72,24 @@ class Database:
     def close(self) -> None:
         self.conn.close()
 
-    def get_mapping(self, source_kind: str, source_track_id: str) -> sqlite3.Row | None:
+    def get_mapping(self, source_track_id: str) -> sqlite3.Row | None:
         return self.conn.execute(
-            "SELECT * FROM track_map WHERE source_kind=? AND source_track_id=?",
-            (source_kind, source_track_id),
+            "SELECT * FROM track_map WHERE source_track_id=?",
+            (source_track_id, ),
+        ).fetchone()
+        
+    def get_mapping_from_yandex(self, yandex_track_id: str, yandex_album_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM track_map WHERE yandex_track_id=? AND yandex_album_id=?",
+            (yandex_track_id, yandex_album_id),
         ).fetchone()
 
     def save_mapping(
         self,
-        source_kind: str,
-        source_track_id: str,
-        source_title: str,
-        source_artists: str,
+        source_kind: str | None,
+        source_track_id: str | None,
+        source_title: str | None,
+        source_artists: str | None,
         source_duration_ms: int | None,
         yandex_track_id: str | None,
         yandex_album_id: str | None,
@@ -119,12 +125,12 @@ class Database:
         )
         self.conn.commit()
 
-    def get_binding_tracks(self, binding_name: str) -> dict[str, sqlite3.Row]:
+    def get_binding_tracks(self, binding_name: str, source_kind: str) -> dict[str, sqlite3.Row]:
         rows = self.conn.execute(
             "SELECT * FROM binding_track_state WHERE binding_name=?",
             (binding_name,),
         ).fetchall()
-        return {str(row["source_track_id"]): row for row in rows}
+        return {str(row["source_track_id" if source_kind == "spotify" else "yandex_track_id"]): row for row in rows}
 
     def replace_binding_tracks(
         self,

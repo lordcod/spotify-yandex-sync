@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .models import SourceTrack
+from .models import SpotifyTrack
 
 
 TRACK_ID_RE = re.compile(r"/track/([A-Za-z0-9]+)")
@@ -36,11 +36,11 @@ class SpotifyWebDailyMix:
             browser.close()
         print("Browser-сессия Spotify сохранена.")
 
-    def get_tracks(self, playlist_url: str, headless: bool = True) -> list[SourceTrack]:
+    def get_tracks(self, playlist_url: str, headless: bool = True) -> list[SpotifyTrack]:
         from playwright.sync_api import sync_playwright
 
         url = _normalize_spotify_url(playlist_url)
-        result: list[SourceTrack] = []
+        result: list[SpotifyTrack] = []
         seen: set[str] = set()
 
         with sync_playwright() as p:
@@ -80,7 +80,7 @@ class SpotifyWebDailyMix:
                     if title:
                         seen.add(track_id)
                         result.append(
-                            SourceTrack(
+                            SpotifyTrack(
                                 source_id=track_id,
                                 title=title,
                                 artists=artists,

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from ast import Pass
 import hashlib
 import json
+
+from sync_music.models import SpotifyTrack
 
 from .config import resolve_path
 from .daily_mix import SpotifyWebDailyMix
@@ -13,7 +16,7 @@ from .yandex import YandexTarget, load_yandex_client
 
 def source_hash(tracks) -> str:
     payload = [
-        [t.source_id, t.title, t.artists, t.duration_ms]
+        [t.source_id if isinstance(t, SpotifyTrack) else t.track_id, t.title, t.artists, t.duration_ms]
         for t in tracks
     ]
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -33,7 +36,7 @@ class SyncEngine:
         self.yandex_client = load_yandex_client(resolve_path(cfg["yandex"]["token_file"]))
         self.target = YandexTarget(self.yandex_client)
         self.db = Database(resolve_path("data/sync.db"))
-        self.matcher = Matcher(self.yandex_client, self.db, cfg["matching"])
+        self.matcher = Matcher(self.yandex_client, self.spotify, self.db, cfg["matching"])
 
     def close(self):
         self.db.close()
@@ -53,6 +56,8 @@ class SyncEngine:
                 raise ValueError(f"{binding['name']}: source_url пуст")
             web = SpotifyWebDailyMix(resolve_path(self.cfg["spotify"]["browser_profile"]))
             return web.get_tracks(url, headless=True), "spotify"
+        if source == 'yandex_likes':
+            return self.target.get_likes(), "yandex"
         raise ValueError(f"Неизвестный source: {source}")
 
     @staticmethod
@@ -62,20 +67,28 @@ class SyncEngine:
             return explicit
         # Backward-compatible migration: old configs did not have `target`.
         # Liked Songs now naturally target native Yandex likes by default.
+        if binding.get("source") == "yandex_likes":
+            return "spotify_liked"
         if binding.get("source") == "spotify_liked":
             return "yandex_likes"
         return "yandex_playlist"
 
-    def _sync_native_likes(self, name, binding, tracks, matched_pairs, digest):
+    def _sync_native_likes(self, source_kind, name, binding, tracks, matched_pairs, digest):
         sync_mode = str(binding.get("sync_mode", "mirror")).strip().lower()
         if sync_mode not in {"mirror", "add_only"}:
             raise ValueError(
                 f"{name}: sync_mode должен быть 'mirror' или 'add_only', получено {sync_mode!r}"
             )
+            
+        def _id(track):
+            return track.source_id if source_kind == "spotify" else track.track_id
+        
+        def _id_ref(track):
+            return track.track_id if source_kind == "spotify" else track.source_id
 
-        current_source_ids = {track.source_id for track in tracks}
-        matched_by_source = {track.source_id: ref for track, ref in matched_pairs}
-        previous = self.db.get_binding_tracks(name)
+        current_source_ids = {_id(track) for track in tracks}
+        matched_by_source = {_id(track): ref for track, ref in matched_pairs}
+        previous = self.db.get_binding_tracks(name, source_kind)
 
         # In mirror mode remove only likes previously managed by this binding
         # when their Spotify source track was removed, or when the mapping has
@@ -83,42 +96,49 @@ class SyncEngine:
         managed_remove_ids: set[str] = set()
         if sync_mode == "mirror":
             for source_id, row in previous.items():
-                old_yandex_id = str(row["yandex_track_id"])
+                old_id = str(row["yandex_track_id" if source_kind == "yandex" else "source_track_id"])
                 if source_id not in current_source_ids:
-                    managed_remove_ids.add(old_yandex_id)
+                    managed_remove_ids.add(old_id)
                     continue
                 new_ref = matched_by_source.get(source_id)
-                if new_ref is not None and str(new_ref.track_id) != old_yandex_id:
-                    managed_remove_ids.add(old_yandex_id)
+                if new_ref is not None and _id_ref(new_ref) != old_id:
+                    managed_remove_ids.add(old_id)
 
-        desired_ids = {str(ref.track_id) for _, ref in matched_pairs}
-        result = self.target.sync_likes(desired_ids, managed_remove_ids)
+        desired_ids = {str(_id_ref(ref)) for _, ref in matched_pairs}
+        if source_kind == 'spotify':
+            result = self.target.sync_likes(desired_ids, managed_remove_ids)
+        else:
+            result = self.spotify.sync_likes(desired_ids, managed_remove_ids)
 
         # Preserve previous state for a currently-present source track if it
         # happens to be unmatched on this run. This prevents a transient
         # matcher failure from forgetting that we manage its old Yandex like.
-        next_state: dict[str, tuple[str, str | None]] = {}
+        next_state: list[tuple[str, str, str]] = []
         for source_id, row in previous.items():
             if source_id in current_source_ids and source_id not in matched_by_source:
-                next_state[source_id] = (
+                next_state.append((
+                    str(row['source_track_id']),
                     str(row["yandex_track_id"]),
                     str(row["yandex_album_id"]) if row["yandex_album_id"] is not None else None,
-                )
-        for source_id, ref in matched_by_source.items():
-            next_state[source_id] = (str(ref.track_id), str(ref.album_id))
+                ))
+        for track, ref in matched_pairs:
+            if source_kind == 'spotify':
+                next_state.append((track.source_id, str(ref.track_id), str(ref.album_id)))
+            else:
+                next_state.append((ref.source_id, str(track.track_id), str(track.album_id)))
 
         self.db.replace_binding_tracks(
             name,
             [
                 (source_id, yandex_id, album_id)
-                for source_id, (yandex_id, album_id) in next_state.items()
+                for source_id, yandex_id, album_id in next_state
             ],
         )
         self.db.save_state(
             name,
             digest,
             "likes",
-            "Yandex Music — Мне нравится",
+            "Yandex Music — Мне нравится" if source_kind == "spotify" else "Spotify — Мне нравится",
             len(tracks),
             len(matched_pairs),
         )
@@ -130,26 +150,36 @@ class SyncEngine:
         run_id = self.db.start_run(name)
         try:
             tracks, source_kind = self._source_tracks(binding)
+            previous = set(self.db.get_binding_tracks(name, source_kind))
             digest = source_hash(tracks)
             print(f"[{name}] source: {len(tracks)} tracks")
 
             matched_pairs = []
             unmatched = []
             for i, track in enumerate(tracks, 1):
-                ref = self.matcher.match(source_kind, track)
+                if source_kind == 'spotify':
+                    if track.source_id in previous:
+                        continue
+                    ref = self.matcher.match(source_kind, track)
+                else:
+                    if track.track_id in previous:
+                        continue
+                    ref = self.matcher.yandex_match(source_kind, track)
                 if ref:
                     matched_pairs.append((track, ref))
                 else:
                     unmatched.append(track)
-                    print(f"[{name}] unmatched: {track.artist_text} — {track.title}")
+                    art = track.artist_text if source_kind == 'spotify' else (''.join(track.artists))
+                    print(f"[{name}] unmatched: {art} — {track.title}")
                 if i % 25 == 0:
                     print(f"[{name}] matched {len(matched_pairs)}/{i}")
 
             matched = [ref for _, ref in matched_pairs]
             target_kind = self._target_kind(binding)
 
-            if target_kind == "yandex_likes":
+            if target_kind in ("yandex_likes", "spotify_liked"):
                 like_result = self._sync_native_likes(
+                    source_kind,
                     name, binding, tracks, matched_pairs, digest
                 )
                 changed = bool(like_result["changed"])
