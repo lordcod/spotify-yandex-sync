@@ -2,7 +2,6 @@ spotify:
   client_id: "PASTE_SPOTIFY_CLIENT_ID_HERE"
   redirect_uri: "http://127.0.0.1:8787/callback"
   token_file: "data/spotify_token.json"
-  browser_profile: "data/spotify_browser_profile"
   request_timeout_seconds: 30
 
 yandex:
@@ -14,30 +13,11 @@ matching:
   high_confidence_score: 94
   duration_tolerance_ms: 8000
   debug_unmatched: true
+  yandex_search_interval_seconds: 1.0
 
+# One job for native likes in both services.
 playlists:
-  # Spotify Liked Songs -> native Yandex Music «Мне нравится» likes.
-  # mirror = if a managed track is later unliked in Spotify, its Yandex like
-  # is also removed. Existing unrelated Yandex likes are NOT deleted.
   - name: liked
-    source: spotify_liked
-    target: yandex_likes
+    source: likes
     sync_mode: mirror
-
-  # A Spotify playlist OWNED BY YOU or collaborative with you -> Yandex playlist
-  # - name: main
-  #   source: spotify_playlist
-  #   source_id: "YOUR_SPOTIFY_PLAYLIST_ID"
-  #   target: yandex_playlist
-  #   target_title: "Spotify — Main"
-  #   target_visibility: private
-
-  # Spotify-owned Daily Mix cannot be read through the current Web API.
-  # We read your own Spotify Web session with Playwright instead.
-  # Paste the Share -> Copy link to playlist URL below.
-  # - name: daily_mix_1
-  #   source: spotify_daily_mix
-  #   source_url: "https://open.spotify.com/playlist/..."
-  #   target: yandex_playlist
-  #   target_title: "Spotify — Daily Mix 1"
-  #   target_visibility: private
+    initial_limit: 20

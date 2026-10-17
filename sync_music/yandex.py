@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from yandex_music import Client, Track
-from yandex_music.utils.difference import Difference
+from yandex_music import Client
 
 from .models import YandexTrack
 
@@ -60,61 +60,14 @@ class YandexTarget:
     def __init__(self, client: Client):
         self.client = client
 
-    # ---------- Regular Yandex playlists ----------
-
-    def find_or_create_playlist(self, title: str, visibility: str = "private"):
-        playlists = self.client.users_playlists_list()
-        exact = [p for p in playlists if getattr(p, "title", None) == title]
-        if exact:
-            # Fetch the full playlist, including tracks/revision.
-            return self.client.users_playlists(exact[0].kind)
-        created = self.client.users_playlists_create(title, visibility=visibility)
-        if created is None:
-            raise RuntimeError(f"Yandex не создал плейлист: {title}")
-        return self.client.users_playlists(created.kind)
-
-    @staticmethod
-    def playlist_ids(playlist) -> list[str]:
-        ids: list[str] = []
-        for item in getattr(playlist, "tracks", None) or []:
-            track_id = getattr(item, "id", None)
-            album_id = getattr(item, "album_id", None)
-            if track_id and album_id:
-                ids.append(f"{track_id}:{album_id}")
-        return ids
-
-    def replace_if_changed(self, playlist, desired: list[YandexTrack]) -> bool:
-        current_ids = self.playlist_ids(playlist)
-        desired_ids = [x.full_id for x in desired]
-        if current_ids == desired_ids:
-            return False
-
-        diff = Difference()
-        if current_ids:
-            # Yandex difference uses a half-open range [from, to).
-            diff.add_delete(0, len(current_ids))
-        if desired:
-            diff.add_insert(
-                0,
-                [{"id": x.track_id, "album_id": x.album_id} for x in desired],
-            )
-        changed = self.client.users_playlists_change(
-            playlist.kind,
-            diff.to_json(),
-            revision=playlist.revision,
-            user_id=playlist.owner.uid,
-        )
-        if changed is None:
-            raise RuntimeError("Yandex вернул пустой ответ при изменении плейлиста")
-        return True
-
-    # ---------- Native Yandex Music likes / «Мне нравится» ----------
-
     def liked_track_ids(self) -> set[str]:
+        return set(self.ordered_liked_track_ids())
+
+    def ordered_liked_track_ids(self) -> list[str]:
         """Return Yandex track IDs currently liked by the authenticated user."""
         liked = self.client.users_likes_tracks()
         if liked is None:
-            return set()
+            raise RuntimeError("Yandex returned no likes snapshot")
 
         # TracksList is iterable, but keeping this fallback makes the code
         # tolerant to older/newer library model implementations.
@@ -122,11 +75,15 @@ class YandexTarget:
         if items is None:
             items = liked
 
-        result: set[str] = set()
-        for item in items or []:
+        items = list(items or [])
+        # Use like timestamps when available; otherwise retain API order.
+        if items and all(getattr(item, "timestamp", None) for item in items):
+            items.sort(key=lambda item: datetime.fromisoformat(item.timestamp.replace("Z", "+00:00")).timestamp(), reverse=True)
+        result: list[str] = []
+        for item in items:
             track_id = getattr(item, "id", None)
             if track_id is not None:
-                result.add(str(track_id))
+                result.append(str(track_id))
         return result
 
     def sync_likes(
@@ -144,7 +101,7 @@ class YandexTarget:
         """
         current = self.liked_track_ids()
         to_add = sorted(desired_track_ids - current)
-        to_remove = sorted((managed_remove_ids or set()) & current)
+        to_remove = sorted(((managed_remove_ids or set()) & current) - desired_track_ids)
 
         # Remove first so a changed Spotify->Yandex mapping cannot leave both
         # old and new versions liked after a successful run.
@@ -170,12 +127,16 @@ class YandexTarget:
         }
     
     def get_likes(self) -> list[YandexTrack]:
-        return [
-            YandexTrack(track.id,
-                        track.albums[0].id, 
-                        track.title, 
-                        [art.name for art in track.artists],
-                        track.duration_ms)
-            for track in self.client.tracks(list(self.liked_track_ids()))
-            if track.albums
-        ]
+        result = []
+        ids = self.ordered_liked_track_ids()
+        for batch in _chunks(ids):
+            tracks = self.client.tracks(batch)
+            if tracks is None or {str(t.id) for t in tracks} != set(batch):
+                raise RuntimeError("Yandex returned an incomplete likes snapshot")
+            by_id = {str(track.id): track for track in tracks}
+            for track in (by_id[track_id] for track_id in batch):
+                result.append(YandexTrack(
+                    str(track.id), str(track.albums[0].id) if track.albums else "",
+                    track.title or "", [art.name for art in track.artists], track.duration_ms,
+                ))
+        return result

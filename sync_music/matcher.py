@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+import time
 import unicodedata
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 
 from rapidfuzz import fuzz
+from yandex_music.exceptions import NetworkError, TimedOutError
 
 from .db import Database
 from .models import SpotifyTrack, YandexTrack
@@ -132,23 +134,6 @@ class CandidateScorer:
         return max((TextMatcher.similarity(source.album, title) for title in albums), default=70.0)
 
 
-# Compatibility with existing imports from this module.
-def normalize(text: str) -> str:
-    return TextMatcher.normalize(text)
-
-
-def transliterate_ru(text: str) -> str:
-    return TextMatcher.transliterate(text)
-
-
-def latinize(text: str) -> str:
-    return TextMatcher.latinize(text)
-
-
-def score_candidate(source, candidate, duration_tolerance_ms: int) -> CandidateScore:
-    return CandidateScorer(duration_tolerance_ms).score(source, candidate)
-
-
 def _artists(track) -> list[str]:
     try:
         return [name for name in track.artists_name() if name]
@@ -166,6 +151,8 @@ class Matcher:
         self.candidate_limit = int(cfg.get("candidate_limit", 30))
         self.debug_unmatched = bool(cfg.get("debug_unmatched", True))
         self.scorer = CandidateScorer(int(cfg.get("duration_tolerance_ms", 8000)))
+        self.yandex_search_interval = max(0.0, float(cfg.get("yandex_search_interval_seconds", 1.0)))
+        self._next_yandex_search = 0.0
 
     # Search -----------------------------------------------------------------
 
@@ -175,31 +162,46 @@ class Matcher:
         combined = " ".join([*artists, source.title])
 
         queries = [combined, f"{source.title} {main_artist}", source.title]
-        latin = latinize(combined)
-        if latin and latin != normalize(combined):
+        latin = TextMatcher.latinize(combined)
+        if latin and latin != TextMatcher.normalize(combined):
             queries.append(latin)
 
         result, seen = [], set()
         for query in queries:
             query = query.strip()
-            key = normalize(query)
+            key = TextMatcher.normalize(query)
             if query and key and key not in seen:
                 result.append(query)
                 seen.add(key)
         return result
 
     def _search_yandex(self, query: str) -> list:
-        try:
-            page = self.client.search(query, type_="track")
-            return list(getattr(getattr(page, "tracks", None), "results", None) or [])[: self.candidate_limit]
-        except Exception:
-            return []
+        for attempt in range(6):
+            delay = self._next_yandex_search - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                page = self.client.search(query, type_="track")
+                return list(getattr(getattr(page, "tracks", None), "results", None) or [])[: self.candidate_limit]
+            except NetworkError as exc:
+                # This SDK exposes HTTP status only in the exception text;
+                # 502 is special-cased to "Bad Gateway" by its transport.
+                transient = (
+                    isinstance(exc, TimedOutError)
+                    or re.search(r"\((?:429|500|502|503|504)\):", str(exc))
+                    or str(exc) == "Bad Gateway"
+                )
+                if not transient or attempt == 5:
+                    raise
+                delay = 2 ** (attempt + 1)
+                print(f"[Yandex search] temporary error; retry {attempt + 1}/5 in {delay}s", flush=True)
+                time.sleep(delay)
+            finally:
+                self._next_yandex_search = time.monotonic() + self.yandex_search_interval
+        raise AssertionError("unreachable")
 
     def _search_spotify(self, query: str) -> list:
-        try:
-            return list(self.spotify_client.search(query) or [])[: self.candidate_limit]
-        except Exception:
-            return []
+        return list(self.spotify_client.search(query) or [])[: self.candidate_limit]
 
     def _find_best_candidate(
         self,
@@ -259,7 +261,7 @@ class Matcher:
         if not row or row["status"] != "matched" or not row["source_track_id"]:
             return None
         return SpotifyTrack(
-            row["source_track_id"], row["source_title"], row["source_artists"],
+            row["source_track_id"], row["source_title"], (row["source_artists"] or "").split(", "),
             row["source_duration_ms"], "", "", row["match_score"],
         )
 
@@ -286,7 +288,7 @@ class Matcher:
         else:
             self.db.save_mapping(
                 source_kind, target.source_id, target.title, target.artist_text, target.duration_ms,
-                source.track_id, source.album_id, source.title, ", ".join(source.artists),
+                source.track_id, source.album_id, source.title, " | ".join(source.artists),
                 score.total, "matched",
             )
 

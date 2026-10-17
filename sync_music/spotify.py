@@ -19,7 +19,7 @@ from .models import SpotifyTrack
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_URL = "https://api.spotify.com/v1"
-SCOPES = "user-library-read user-library-modify playlist-read-private"
+SCOPES = "user-library-read user-library-modify"
 
 class SpotifyAuthError(RuntimeError):
     pass
@@ -239,36 +239,6 @@ class SpotifyClient:
             offset += len(batch)
         return items
 
-    def current_user_playlists(self) -> list[dict]:
-        playlists: list[dict] = []
-        offset = 0
-        while True:
-            data = self.get("/me/playlists", {"limit": 50, "offset": offset})
-            batch = data.get("items", [])
-            playlists.extend(batch)
-            if not data.get("next") or not batch:
-                break
-            offset += len(batch)
-        return playlists
-
-    def playlist_tracks(self, playlist_id: str) -> list[SpotifyTrack]:
-        items: list[SpotifyTrack] = []
-        offset = 0
-        while True:
-            data = self.get(
-                f"/playlists/{playlist_id}/items",
-                {"limit": 50, "offset": offset},
-            )
-            batch = data.get("items", [])
-            for wrapper in batch:
-                track = self._to_track(wrapper.get("item") or wrapper.get("track") or {})
-                if track:
-                    items.append(track)
-            if not data.get("next") or not batch:
-                break
-            offset += len(batch)
-        return items
-
     def _library_request(self, method: str, track_ids: set[str]) -> None:
         ids = list(track_ids)
 
@@ -317,12 +287,12 @@ class SpotifyClient:
         )
 
         if to_add:
-            print('Add', to_add)
-            # self._library_request("PUT", to_add)
+            print(f'[Spotify] adding {len(to_add)} likes', flush=True)
+            self._library_request("PUT", to_add)
 
         if to_remove:
-            print('Remove', to_remove)
-            # self._library_request("DELETE", to_remove)
+            print(f'[Spotify] removing {len(to_remove)} likes', flush=True)
+            self._library_request("DELETE", to_remove)
 
         return {
             "changed": bool(to_add or to_remove),

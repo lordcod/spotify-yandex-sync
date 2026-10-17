@@ -24,7 +24,3 @@ class YandexTrack:
     artists: list[str]
     duration_ms: int | None
     score: float | None = None
-
-    @property
-    def full_id(self) -> str:
-        return f"{self.track_id}:{self.album_id}"

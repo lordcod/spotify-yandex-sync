@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 SCHEMA = """
@@ -22,27 +23,16 @@ CREATE TABLE IF NOT EXISTS track_map (
     PRIMARY KEY (source_kind, source_track_id, yandex_track_id)
 );
 
-CREATE TABLE IF NOT EXISTS playlist_state (
-    binding_name TEXT PRIMARY KEY,
-    source_hash TEXT,
-    yandex_playlist_kind TEXT,
-    target_title TEXT,
-    last_synced_at TEXT,
-    last_source_count INTEGER,
-    last_matched_count INTEGER
+CREATE TABLE IF NOT EXISTS likes_ignored (
+    name TEXT PRIMARY KEY,
+    spotify TEXT NOT NULL,
+    yandex TEXT NOT NULL
 );
 
--- Tracks managed by a particular sync binding. This is especially important
--- for Spotify Liked Songs -> native Yandex likes: it lets us remove a Yandex
--- like only after that Spotify track was previously managed by this binding,
--- without touching unrelated likes that existed in Yandex beforehand.
-CREATE TABLE IF NOT EXISTS binding_track_state (
-    binding_name TEXT NOT NULL,
-    source_track_id TEXT NOT NULL,
-    yandex_track_id TEXT NOT NULL,
-    yandex_album_id TEXT,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (binding_name, source_track_id)
+CREATE TABLE IF NOT EXISTS likes_sync_state (
+    name TEXT PRIMARY KEY,
+    pairs TEXT NOT NULL DEFAULT '[]',
+    pending TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sync_runs (
@@ -74,13 +64,13 @@ class Database:
 
     def get_mapping(self, source_track_id: str) -> sqlite3.Row | None:
         return self.conn.execute(
-            "SELECT * FROM track_map WHERE source_track_id=?",
+            "SELECT * FROM track_map WHERE source_track_id=? ORDER BY (status='matched') DESC, updated_at DESC",
             (source_track_id, ),
         ).fetchone()
         
     def get_mapping_from_yandex(self, yandex_track_id: str, yandex_album_id: str) -> sqlite3.Row | None:
         return self.conn.execute(
-            "SELECT * FROM track_map WHERE yandex_track_id=? AND yandex_album_id=?",
+            "SELECT * FROM track_map WHERE yandex_track_id=? AND yandex_album_id=? ORDER BY (status='matched') DESC, updated_at DESC",
             (yandex_track_id, yandex_album_id),
         ).fetchone()
 
@@ -98,99 +88,25 @@ class Database:
         score: float | None,
         status: str,
     ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO track_map (
-                source_kind, source_track_id, source_title, source_artists,
-                source_duration_ms, yandex_track_id, yandex_album_id,
-                yandex_title, yandex_artists, match_score, status, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(source_kind, source_track_id) DO UPDATE SET
-                source_title=excluded.source_title,
-                source_artists=excluded.source_artists,
-                source_duration_ms=excluded.source_duration_ms,
-                yandex_track_id=excluded.yandex_track_id,
-                yandex_album_id=excluded.yandex_album_id,
-                yandex_title=excluded.yandex_title,
-                yandex_artists=excluded.yandex_artists,
-                match_score=excluded.match_score,
-                status=excluded.status,
-                updated_at=CURRENT_TIMESTAMP
-            """,
-            (
-                source_kind, source_track_id, source_title, source_artists,
-                source_duration_ms, yandex_track_id, yandex_album_id,
-                yandex_title, yandex_artists, score, status,
-            ),
-        )
-        self.conn.commit()
-
-    def get_binding_tracks(self, binding_name: str, source_kind: str) -> dict[str, sqlite3.Row]:
-        rows = self.conn.execute(
-            "SELECT * FROM binding_track_state WHERE binding_name=?",
-            (binding_name,),
-        ).fetchall()
-        return {str(row["source_track_id" if source_kind == "spotify" else "yandex_track_id"]): row for row in rows}
-
-    def replace_binding_tracks(
-        self,
-        binding_name: str,
-        rows: Iterable[tuple[str, str, str | None]],
-    ) -> None:
-        """Atomically replace the managed source->Yandex mapping for a binding."""
-        rows = list(rows)
+        # Explicit replacement supports both historical primary-key layouts,
+        # and NULL Spotify IDs for unmatched Yandex tracks.
         with self.conn:
             self.conn.execute(
-                "DELETE FROM binding_track_state WHERE binding_name=?",
-                (binding_name,),
+                "DELETE FROM track_map WHERE source_kind=? AND "
+                + ("source_track_id=?" if source_track_id is not None else
+                   "source_track_id IS NULL AND yandex_track_id=?"),
+                (source_kind, source_track_id if source_track_id is not None else yandex_track_id),
             )
-            self.conn.executemany(
-                """
-                INSERT INTO binding_track_state (
-                    binding_name, source_track_id, yandex_track_id,
-                    yandex_album_id, updated_at
-                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """,
-                [
-                    (binding_name, source_id, yandex_id, album_id)
-                    for source_id, yandex_id, album_id in rows
-                ],
+            self.conn.execute(
+                """INSERT INTO track_map (
+                    source_kind, source_track_id, source_title, source_artists,
+                    source_duration_ms, yandex_track_id, yandex_album_id,
+                    yandex_title, yandex_artists, match_score, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (source_kind, source_track_id, source_title, source_artists,
+                 source_duration_ms, yandex_track_id, yandex_album_id,
+                 yandex_title, yandex_artists, score, status),
             )
-
-    def get_state(self, binding_name: str) -> sqlite3.Row | None:
-        return self.conn.execute(
-            "SELECT * FROM playlist_state WHERE binding_name=?", (binding_name,)
-        ).fetchone()
-
-    def save_state(
-        self,
-        binding_name: str,
-        source_hash: str,
-        yandex_playlist_kind: str,
-        target_title: str,
-        source_count: int,
-        matched_count: int,
-    ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO playlist_state (
-                binding_name, source_hash, yandex_playlist_kind, target_title,
-                last_synced_at, last_source_count, last_matched_count
-            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-            ON CONFLICT(binding_name) DO UPDATE SET
-                source_hash=excluded.source_hash,
-                yandex_playlist_kind=excluded.yandex_playlist_kind,
-                target_title=excluded.target_title,
-                last_synced_at=CURRENT_TIMESTAMP,
-                last_source_count=excluded.last_source_count,
-                last_matched_count=excluded.last_matched_count
-            """,
-            (
-                binding_name, source_hash, yandex_playlist_kind, target_title,
-                source_count, matched_count,
-            ),
-        )
-        self.conn.commit()
 
     def start_run(self, binding_name: str) -> int:
         cur = self.conn.execute(
@@ -215,3 +131,27 @@ class Database:
             f"UPDATE sync_runs SET {', '.join(parts)} WHERE id=?", values
         )
         self.conn.commit()
+
+    def likes_state(self, name: str) -> tuple[list, dict | None]:
+        row = self.conn.execute("SELECT pairs, pending FROM likes_sync_state WHERE name=?", (name,)).fetchone()
+        return (json.loads(row["pairs"]), json.loads(row["pending"]) if row["pending"] else None) if row else ([], None)
+
+    def save_likes_state(self, name: str, pairs: list, pending: dict | None = None) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO likes_sync_state(name, pairs, pending) VALUES (?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET pairs=excluded.pairs, pending=excluded.pending",
+                (name, json.dumps(pairs), json.dumps(pending) if pending is not None else None),
+            )
+
+    def ignored_likes(self, name: str) -> tuple[set[str], set[str]] | None:
+        row = self.conn.execute("SELECT spotify, yandex FROM likes_ignored WHERE name=?", (name,)).fetchone()
+        return (set(json.loads(row[0])), set(json.loads(row[1]))) if row else None
+
+    def save_ignored_likes(self, name: str, spotify: set[str], yandex: set[str]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO likes_ignored VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
+                "spotify=excluded.spotify, yandex=excluded.yandex",
+                (name, json.dumps(sorted(spotify)), json.dumps(sorted(yandex))),
+            )
